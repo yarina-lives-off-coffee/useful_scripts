@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-  "contentVersion": "1.1.0",
+  "contentVersion": "1.2.0",
 
   "parameters": {
     "vmName": {
@@ -78,6 +78,22 @@
       }
     },
 
+    "enableHttps": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Whether to allow inbound HTTPS traffic on TCP/443."
+      }
+    },
+
+    "enableAcceleratedNetworking": {
+      "type": "bool",
+      "defaultValue": "[equals(parameters('vmSize'), 'Standard_D2s_v5')]",
+      "metadata": {
+        "description": "Enable Azure Accelerated Networking. Defaults based on VM size; only override to true for sizes that support it."
+      }
+    },
+
     "environment": {
       "type": "string",
       "defaultValue": "dev",
@@ -105,6 +121,14 @@
       "metadata": {
         "description": "Cost center tag for billing allocation."
       }
+    },
+
+    "deploymentTimestamp": {
+      "type": "string",
+      "defaultValue": "[utcNow('u')]",
+      "metadata": {
+        "description": "Timestamp of the deployment."
+      }
     }
   },
 
@@ -116,32 +140,17 @@
     "osDiskName": "[concat(parameters('vmName'), '-osdisk')]",
     "ipConfigName": "ipconfig1",
     "publicIpName": "[concat(parameters('vmName'), '-pip')]",
-    "storageAccountName": "[concat('bootdiag', uniqueString(resourceGroup().id))]",
+    "identityName": "[concat(parameters('vmName'), '-identity')]",
+
     "commonTags": {
       "environment": "[parameters('environment')]",
       "owner": "[parameters('owner')]",
       "costCenter": "[parameters('costCenter')]",
-      "created": "[utcNow('u')]"
+      "created": "[parameters('deploymentTimestamp')]"
     }
   },
 
   "resources": [
-
-    {
-      "type": "Microsoft.Storage/storageAccounts",
-      "apiVersion": "2024-01-01",
-      "name": "[variables('storageAccountName')]",
-      "location": "[parameters('location')]",
-      "tags": "[variables('commonTags')]",
-      "sku": {
-        "name": "Standard_LRS"
-      },
-      "kind": "StorageV2",
-      "properties": {
-        "accessTier": "Hot",
-        "minimumTlsVersion": "TLS1_2"
-      }
-    },
 
     {
       "type": "Microsoft.Network/publicIPAddresses",
@@ -177,35 +186,29 @@
               "sourceAddressPrefix": "[parameters('adminSourceIp')]",
               "destinationAddressPrefix": "*"
             }
-          },
-          {
-            "name": "Allow-HTTPS",
-            "properties": {
-              "priority": 110,
-              "access": "Allow",
-              "direction": "Inbound",
-              "protocol": "Tcp",
-              "sourcePortRange": "*",
-              "destinationPortRange": "443",
-              "sourceAddressPrefix": "*",
-              "destinationAddressPrefix": "*"
-            }
-          },
-          {
-            "name": "Deny-All-Inbound",
-            "properties": {
-              "priority": 4096,
-              "access": "Deny",
-              "direction": "Inbound",
-              "protocol": "*",
-              "sourcePortRange": "*",
-              "destinationPortRange": "*",
-              "sourceAddressPrefix": "*",
-              "destinationAddressPrefix": "*"
-            }
           }
         ]
       }
+    },
+
+    {
+      "type": "Microsoft.Network/networkSecurityGroups/securityRules",
+      "apiVersion": "2024-05-01",
+      "name": "[concat(variables('nsgName'), '/Allow-HTTPS')]",
+      "condition": "[parameters('enableHttps')]",
+      "properties": {
+        "priority": 110,
+        "access": "Allow",
+        "direction": "Inbound",
+        "protocol": "Tcp",
+        "sourcePortRange": "*",
+        "destinationPortRange": "443",
+        "sourceAddressPrefix": "*",
+        "destinationAddressPrefix": "*"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
+      ]
     },
 
     {
@@ -220,6 +223,7 @@
             "[parameters('vnetAddressPrefix')]"
           ]
         },
+
         "subnets": [
           {
             "name": "[variables('subnetName')]",
@@ -232,6 +236,7 @@
           }
         ]
       },
+
       "dependsOn": [
         "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
       ]
@@ -243,35 +248,38 @@
       "name": "[variables('nicName')]",
       "location": "[parameters('location')]",
       "tags": "[variables('commonTags')]",
+
       "properties": {
         "ipConfigurations": [
           {
             "name": "[variables('ipConfigName')]",
+
             "properties": {
               "privateIPAllocationMethod": "Dynamic",
+
               "subnet": {
                 "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('subnetName'))]"
               },
-              "publicIPAddress": "[if(parameters('enablePublicIp'), json(concat('{\"id\": \"', resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName')), '\"}')), json('null'))]"
+              
+              "publicIPAddress": "[if(parameters('enablePublicIp'), createObject('id', resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName'))), json('null'))]"
             }
           }
         ],
-        "networkSecurityGroup": {
-          "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
-        },
+
         "enableIPForwarding": false,
-        "enableAcceleratedNetworking": "[equals(parameters('vmSize'), 'Standard_D2s_v5')]"
+        "enableAcceleratedNetworking": "[parameters('enableAcceleratedNetworking')]"
       },
+
       "dependsOn": [
         "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]",
-        "[if(parameters('enablePublicIp'), resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName')), resourceId('Microsoft.Network/virtualNetworks', variables('vnetName')))]"
+        "[resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName'))]"
       ]
     },
 
     {
       "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
       "apiVersion": "2023-01-31",
-      "name": "[concat(parameters('vmName'), '-identity')]",
+      "name": "[variables('identityName')]",
       "location": "[parameters('location')]",
       "tags": "[variables('commonTags')]"
     },
@@ -285,10 +293,12 @@
       "identity": {
         "type": "UserAssigned",
         "userAssignedIdentities": {
-          "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', concat(parameters('vmName'), '-identity'))]": {}
+          "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName'))]": {}
         }
       },
+
       "properties": {
+
         "hardwareProfile": {
           "vmSize": "[parameters('vmSize')]"
         },
@@ -304,9 +314,11 @@
           "osDisk": {
             "name": "[variables('osDiskName')]",
             "createOption": "FromImage",
+
             "managedDisk": {
               "storageAccountType": "Premium_LRS"
             },
+
             "diskSizeGB": 64
           }
         },
@@ -314,8 +326,10 @@
         "osProfile": {
           "computerName": "[parameters('vmName')]",
           "adminUsername": "[parameters('adminUsername')]",
+
           "linuxConfiguration": {
             "disablePasswordAuthentication": true,
+
             "ssh": {
               "publicKeys": [
                 {
@@ -324,6 +338,7 @@
                 }
               ]
             },
+
             "patchSettings": {
               "patchMode": "AutomaticByPlatform",
               "automaticByPlatformSettings": {
@@ -331,7 +346,8 @@
               }
             }
           },
-          "customData": "[base64(concat('#!/bin/bash\n', 'apt-get update && apt-get upgrade -y\n', 'apt-get install -y fail2ban ufw curl wget ca-certificates\n', 'systemctl enable fail2ban\n', 'systemctl start fail2ban\n', 'ufw --force enable\n', 'ufw default deny incoming\n', 'ufw default allow outgoing\n', 'ufw allow 22/tcp\n', 'ufw allow 443/tcp\n', 'echo \"Security hardening complete\"\n'))]"
+
+          "customData": "[base64(concat('#!/bin/bash\n', 'set -e\n', 'apt-get update\n', 'apt-get install -y fail2ban ufw curl wget ca-certificates\n', 'systemctl enable --now fail2ban\n', 'ufw default deny incoming\n', 'ufw default allow outgoing\n', 'ufw allow from ', parameters('adminSourceIp'), ' to any port 22 proto tcp\n', if(parameters('enableHttps'), 'ufw allow 443/tcp\n', ''), 'ufw --force enable\n', 'echo \"Security hardening complete\"\n'))]"
         },
 
         "networkProfile": {
@@ -347,21 +363,20 @@
 
         "diagnosticsProfile": {
           "bootDiagnostics": {
-            "enabled": true,
-            "storageUri": "[concat('https://', variables('storageAccountName'), '.blob.core.windows.net')]"
+            "enabled": true
           }
         }
       },
 
       "dependsOn": [
         "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]",
-        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]",
-        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', concat(parameters('vmName'), '-identity'))]"
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName'))]"
       ]
     }
   ],
 
   "outputs": {
+
     "vmName": {
       "type": "string",
       "value": "[parameters('vmName')]"
@@ -369,24 +384,24 @@
 
     "privateIp": {
       "type": "string",
-      "value": "[reference(resourceId('Microsoft.Network/networkInterfaces', variables('nicName')),'2024-05-01').ipConfigurations[0].properties.privateIPAddress]"
+      "value": "[reference(resourceId('Microsoft.Network/networkInterfaces', variables('nicName')), '2024-05-01').ipConfigurations[0].properties.privateIPAddress]"
     },
 
     "publicIp": {
       "type": "string",
       "condition": "[parameters('enablePublicIp')]",
-      "value": "[if(parameters('enablePublicIp'), reference(resourceId('Microsoft.Network/publicIPAddresses',variables('publicIpName')),'2024-05-01').ipAddress, 'N/A - Public IP not enabled')]"
+      "value": "[reference(resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName')), '2024-05-01').ipAddress]"
     },
 
     "sshCommand": {
       "type": "string",
       "condition": "[parameters('enablePublicIp')]",
-      "value": "[if(parameters('enablePublicIp'), concat('ssh -i <your-private-key> ', parameters('adminUsername'), '@', reference(resourceId('Microsoft.Network/publicIPAddresses',variables('publicIpName')),'2024-05-01').ipAddress), 'N/A - Public IP not enabled')]"
+      "value": "[concat('ssh -i <your-private-key> ', parameters('adminUsername'), '@', reference(resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName')), '2024-05-01').ipAddress)]"
     },
 
     "managedIdentityId": {
       "type": "string",
-      "value": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities',concat(parameters('vmName'), '-identity'))]"
+      "value": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('identityName'))]"
     }
   }
 }
