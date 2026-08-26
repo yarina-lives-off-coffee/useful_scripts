@@ -1,6 +1,3 @@
-// Enhanced Linux Ubuntu VM ARM template with security hardening, monitoring, and public IP support
-// Improvements: parameterized networking, public IP, NSG deny-all rule, OS hardening script, managed identity, boot diagnostics, and resource tags
-
 {
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
   "contentVersion": "1.1.0",
@@ -229,20 +226,14 @@
             "properties": {
               "addressPrefix": "[parameters('subnetAddressPrefix')]",
               "networkSecurityGroup": {
-                "id": "[resourceId(
-                  'Microsoft.Network/networkSecurityGroups',
-                  variables('nsgName')
-                )]"
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
               }
             }
           }
         ]
       },
       "dependsOn": [
-        "[resourceId(
-          'Microsoft.Network/networkSecurityGroups',
-          variables('nsgName')
-        )]"
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
       ]
     },
 
@@ -259,30 +250,20 @@
             "properties": {
               "privateIPAllocationMethod": "Dynamic",
               "subnet": {
-                "id": "[resourceId(
-                  'Microsoft.Network/virtualNetworks/subnets',
-                  variables('vnetName'),
-                  variables('subnetName')
-                )]"
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('subnetName'))]"
               },
               "publicIPAddress": "[if(parameters('enablePublicIp'), json(concat('{\"id\": \"', resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName')), '\"}')), json('null'))]"
             }
           }
         ],
         "networkSecurityGroup": {
-          "id": "[resourceId(
-            'Microsoft.Network/networkSecurityGroups',
-            variables('nsgName')
-          )]"
+          "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
         },
         "enableIPForwarding": false,
         "enableAcceleratedNetworking": "[equals(parameters('vmSize'), 'Standard_D2s_v5')]"
       },
       "dependsOn": [
-        "[resourceId(
-          'Microsoft.Network/virtualNetworks',
-          variables('vnetName')
-        )]",
+        "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]",
         "[if(parameters('enablePublicIp'), resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName')), resourceId('Microsoft.Network/virtualNetworks', variables('vnetName')))]"
       ]
     },
@@ -338,11 +319,7 @@
             "ssh": {
               "publicKeys": [
                 {
-                  "path": "[concat(
-                    '/home/',
-                    parameters('adminUsername'),
-                    '/.ssh/authorized_keys'
-                  )]",
+                  "path": "[concat('/home/', parameters('adminUsername'), '/.ssh/authorized_keys')]",
                   "keyData": "[parameters('sshPublicKey')]"
                 }
               ]
@@ -360,10 +337,7 @@
         "networkProfile": {
           "networkInterfaces": [
             {
-              "id": "[resourceId(
-                'Microsoft.Network/networkInterfaces',
-                variables('nicName')
-              )]",
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]",
               "properties": {
                 "primary": true
               }
@@ -380,18 +354,9 @@
       },
 
       "dependsOn": [
-        "[resourceId(
-          'Microsoft.Network/networkInterfaces',
-          variables('nicName')
-        )]",
-        "[resourceId(
-          'Microsoft.Storage/storageAccounts',
-          variables('storageAccountName')
-        )]",
-        "[resourceId(
-          'Microsoft.ManagedIdentity/userAssignedIdentities',
-          concat(parameters('vmName'), '-identity')
-        )]"
+        "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]",
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]",
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', concat(parameters('vmName'), '-identity'))]"
       ]
     }
   ],
@@ -404,45 +369,24 @@
 
     "privateIp": {
       "type": "string",
-      "value": "[reference(
-        resourceId(
-          'Microsoft.Network/networkInterfaces',
-          variables('nicName')
-        ),
-        '2024-05-01'
-      ).ipConfigurations[0].properties.privateIPAddress]"
+      "value": "[reference(resourceId('Microsoft.Network/networkInterfaces', variables('nicName')),'2024-05-01').ipConfigurations[0].properties.privateIPAddress]"
     },
 
     "publicIp": {
       "type": "string",
       "condition": "[parameters('enablePublicIp')]",
-      "value": "[if(parameters('enablePublicIp'), reference(
-        resourceId(
-          'Microsoft.Network/publicIPAddresses',
-          variables('publicIpName')
-        ),
-        '2024-05-01'
-      ).ipAddress, 'N/A - Public IP not enabled')]"
+      "value": "[if(parameters('enablePublicIp'), reference(resourceId('Microsoft.Network/publicIPAddresses',variables('publicIpName')),'2024-05-01').ipAddress, 'N/A - Public IP not enabled')]"
     },
 
     "sshCommand": {
       "type": "string",
       "condition": "[parameters('enablePublicIp')]",
-      "value": "[if(parameters('enablePublicIp'), concat('ssh -i <your-private-key> ', parameters('adminUsername'), '@', reference(
-        resourceId(
-          'Microsoft.Network/publicIPAddresses',
-          variables('publicIpName')
-        ),
-        '2024-05-01'
-      ).ipAddress), 'N/A - Public IP not enabled')]"
+      "value": "[if(parameters('enablePublicIp'), concat('ssh -i <your-private-key> ', parameters('adminUsername'), '@', reference(resourceId('Microsoft.Network/publicIPAddresses',variables('publicIpName')),'2024-05-01').ipAddress), 'N/A - Public IP not enabled')]"
     },
 
     "managedIdentityId": {
       "type": "string",
-      "value": "[resourceId(
-        'Microsoft.ManagedIdentity/userAssignedIdentities',
-        concat(parameters('vmName'), '-identity')
-      )]"
+      "value": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities',concat(parameters('vmName'), '-identity'))]"
     }
   }
 }
