@@ -1,2 +1,3 @@
-Just a bunch of useful powershell scripts. 
-Adding more as I work
+just a bunch of useful powershell/azure scripts for work. 
+adding more as I go. 
+free to use and adjust however u want. 
