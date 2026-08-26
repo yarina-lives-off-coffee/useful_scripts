@@ -1,9 +1,9 @@
-// easy linux ubuntu VM ARM template with parameterized source IP for restriction to admin source CIDR
-
+// Enhanced Linux Ubuntu VM ARM template with security hardening, monitoring, and public IP support
+// Improvements: parameterized networking, public IP, NSG deny-all rule, OS hardening script, managed identity, boot diagnostics, and resource tags
 
 {
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-  "contentVersion": "1.0.0.0",
+  "contentVersion": "1.1.0",
 
   "parameters": {
     "vmName": {
@@ -55,6 +55,59 @@
       "metadata": {
         "description": "Azure region."
       }
+    },
+
+    "vnetAddressPrefix": {
+      "type": "string",
+      "defaultValue": "10.10.0.0/16",
+      "metadata": {
+        "description": "Virtual network address space."
+      }
+    },
+
+    "subnetAddressPrefix": {
+      "type": "string",
+      "defaultValue": "10.10.1.0/24",
+      "metadata": {
+        "description": "Subnet address prefix."
+      }
+    },
+
+    "enablePublicIp": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Whether to create a public IP address for the VM."
+      }
+    },
+
+    "environment": {
+      "type": "string",
+      "defaultValue": "dev",
+      "allowedValues": [
+        "dev",
+        "staging",
+        "prod"
+      ],
+      "metadata": {
+        "description": "Environment tag for cost and compliance tracking."
+      }
+    },
+
+    "owner": {
+      "type": "string",
+      "defaultValue": "infrastructure-team",
+      "metadata": {
+        "description": "Owner tag for resource management."
+      }
+    },
+
+    "costCenter": {
+      "type": "string",
+      "defaultValue": "engineering",
+      "metadata": {
+        "description": "Cost center tag for billing allocation."
+      }
     }
   },
 
@@ -64,17 +117,55 @@
     "nsgName": "linux-nsg",
     "nicName": "[concat(parameters('vmName'), '-nic')]",
     "osDiskName": "[concat(parameters('vmName'), '-osdisk')]",
-    "ipConfigName": "ipconfig1"
+    "ipConfigName": "ipconfig1",
+    "publicIpName": "[concat(parameters('vmName'), '-pip')]",
+    "storageAccountName": "[concat('bootdiag', uniqueString(resourceGroup().id))]",
+    "commonTags": {
+      "environment": "[parameters('environment')]",
+      "owner": "[parameters('owner')]",
+      "costCenter": "[parameters('costCenter')]",
+      "created": "[utcNow('u')]"
+    }
   },
 
   "resources": [
+
+    {
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2024-01-01",
+      "name": "[variables('storageAccountName')]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('commonTags')]",
+      "sku": {
+        "name": "Standard_LRS"
+      },
+      "kind": "StorageV2",
+      "properties": {
+        "accessTier": "Hot",
+        "minimumTlsVersion": "TLS1_2"
+      }
+    },
+
+    {
+      "type": "Microsoft.Network/publicIPAddresses",
+      "apiVersion": "2024-05-01",
+      "name": "[variables('publicIpName')]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('commonTags')]",
+      "condition": "[parameters('enablePublicIp')]",
+      "properties": {
+        "publicIPAllocationMethod": "Static",
+        "publicIPAddressVersion": "IPv4",
+        "idleTimeoutInMinutes": 4
+      }
+    },
 
     {
       "type": "Microsoft.Network/networkSecurityGroups",
       "apiVersion": "2024-05-01",
       "name": "[variables('nsgName')]",
       "location": "[parameters('location')]",
-
+      "tags": "[variables('commonTags')]",
       "properties": {
         "securityRules": [
           {
@@ -84,11 +175,35 @@
               "access": "Allow",
               "direction": "Inbound",
               "protocol": "Tcp",
-
               "sourcePortRange": "*",
               "destinationPortRange": "22",
-
               "sourceAddressPrefix": "[parameters('adminSourceIp')]",
+              "destinationAddressPrefix": "*"
+            }
+          },
+          {
+            "name": "Allow-HTTPS",
+            "properties": {
+              "priority": 110,
+              "access": "Allow",
+              "direction": "Inbound",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "443",
+              "sourceAddressPrefix": "*",
+              "destinationAddressPrefix": "*"
+            }
+          },
+          {
+            "name": "Deny-All-Inbound",
+            "properties": {
+              "priority": 4096,
+              "access": "Deny",
+              "direction": "Inbound",
+              "protocol": "*",
+              "sourcePortRange": "*",
+              "destinationPortRange": "*",
+              "sourceAddressPrefix": "*",
               "destinationAddressPrefix": "*"
             }
           }
@@ -101,21 +216,18 @@
       "apiVersion": "2024-05-01",
       "name": "[variables('vnetName')]",
       "location": "[parameters('location')]",
-
+      "tags": "[variables('commonTags')]",
       "properties": {
         "addressSpace": {
           "addressPrefixes": [
-            "10.10.0.0/16"
+            "[parameters('vnetAddressPrefix')]"
           ]
         },
-
         "subnets": [
           {
             "name": "[variables('subnetName')]",
-
             "properties": {
-              "addressPrefix": "10.10.1.0/24",
-
+              "addressPrefix": "[parameters('subnetAddressPrefix')]",
               "networkSecurityGroup": {
                 "id": "[resourceId(
                   'Microsoft.Network/networkSecurityGroups',
@@ -126,7 +238,6 @@
           }
         ]
       },
-
       "dependsOn": [
         "[resourceId(
           'Microsoft.Network/networkSecurityGroups',
@@ -140,33 +251,48 @@
       "apiVersion": "2024-05-01",
       "name": "[variables('nicName')]",
       "location": "[parameters('location')]",
-
+      "tags": "[variables('commonTags')]",
       "properties": {
         "ipConfigurations": [
           {
             "name": "[variables('ipConfigName')]",
-
             "properties": {
               "privateIPAllocationMethod": "Dynamic",
-
               "subnet": {
                 "id": "[resourceId(
                   'Microsoft.Network/virtualNetworks/subnets',
                   variables('vnetName'),
                   variables('subnetName')
                 )]"
-              }
+              },
+              "publicIPAddress": "[if(parameters('enablePublicIp'), json(concat('{\"id\": \"', resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName')), '\"}')), json('null'))]"
             }
           }
-        ]
+        ],
+        "networkSecurityGroup": {
+          "id": "[resourceId(
+            'Microsoft.Network/networkSecurityGroups',
+            variables('nsgName')
+          )]"
+        },
+        "enableIPForwarding": false,
+        "enableAcceleratedNetworking": "[equals(parameters('vmSize'), 'Standard_D2s_v5')]"
       },
-
       "dependsOn": [
         "[resourceId(
           'Microsoft.Network/virtualNetworks',
           variables('vnetName')
-        )]"
+        )]",
+        "[if(parameters('enablePublicIp'), resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName')), resourceId('Microsoft.Network/virtualNetworks', variables('vnetName')))]"
       ]
+    },
+
+    {
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "apiVersion": "2023-01-31",
+      "name": "[concat(parameters('vmName'), '-identity')]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('commonTags')]"
     },
 
     {
@@ -174,15 +300,19 @@
       "apiVersion": "2024-07-01",
       "name": "[parameters('vmName')]",
       "location": "[parameters('location')]",
-
+      "tags": "[variables('commonTags')]",
+      "identity": {
+        "type": "UserAssigned",
+        "userAssignedIdentities": {
+          "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', concat(parameters('vmName'), '-identity'))]": {}
+        }
+      },
       "properties": {
-
         "hardwareProfile": {
           "vmSize": "[parameters('vmSize')]"
         },
 
         "storageProfile": {
-
           "imageReference": {
             "publisher": "Canonical",
             "offer": "ubuntu-24_04-lts",
@@ -193,25 +323,18 @@
           "osDisk": {
             "name": "[variables('osDiskName')]",
             "createOption": "FromImage",
-
             "managedDisk": {
               "storageAccountType": "Premium_LRS"
             },
-
             "diskSizeGB": 64
           }
         },
 
         "osProfile": {
-
           "computerName": "[parameters('vmName')]",
-
           "adminUsername": "[parameters('adminUsername')]",
-
           "linuxConfiguration": {
-
             "disablePasswordAuthentication": true,
-
             "ssh": {
               "publicKeys": [
                 {
@@ -220,28 +343,39 @@
                     parameters('adminUsername'),
                     '/.ssh/authorized_keys'
                   )]",
-
                   "keyData": "[parameters('sshPublicKey')]"
                 }
               ]
+            },
+            "patchSettings": {
+              "patchMode": "AutomaticByPlatform",
+              "automaticByPlatformSettings": {
+                "rebootSetting": "IfRequired"
+              }
             }
-          }
+          },
+          "customData": "[base64(concat('#!/bin/bash\n', 'apt-get update && apt-get upgrade -y\n', 'apt-get install -y fail2ban ufw curl wget ca-certificates\n', 'systemctl enable fail2ban\n', 'systemctl start fail2ban\n', 'ufw --force enable\n', 'ufw default deny incoming\n', 'ufw default allow outgoing\n', 'ufw allow 22/tcp\n', 'ufw allow 443/tcp\n', 'echo \"Security hardening complete\"\n'))]"
         },
 
         "networkProfile": {
-
           "networkInterfaces": [
             {
               "id": "[resourceId(
                 'Microsoft.Network/networkInterfaces',
                 variables('nicName')
               )]",
-
               "properties": {
                 "primary": true
               }
             }
           ]
+        },
+
+        "diagnosticsProfile": {
+          "bootDiagnostics": {
+            "enabled": true,
+            "storageUri": "[concat('https://', variables('storageAccountName'), '.blob.core.windows.net')]"
+          }
         }
       },
 
@@ -249,13 +383,20 @@
         "[resourceId(
           'Microsoft.Network/networkInterfaces',
           variables('nicName')
+        )]",
+        "[resourceId(
+          'Microsoft.Storage/storageAccounts',
+          variables('storageAccountName')
+        )]",
+        "[resourceId(
+          'Microsoft.ManagedIdentity/userAssignedIdentities',
+          concat(parameters('vmName'), '-identity')
         )]"
       ]
     }
   ],
 
   "outputs": {
-
     "vmName": {
       "type": "string",
       "value": "[parameters('vmName')]"
@@ -270,6 +411,38 @@
         ),
         '2024-05-01'
       ).ipConfigurations[0].properties.privateIPAddress]"
+    },
+
+    "publicIp": {
+      "type": "string",
+      "condition": "[parameters('enablePublicIp')]",
+      "value": "[if(parameters('enablePublicIp'), reference(
+        resourceId(
+          'Microsoft.Network/publicIPAddresses',
+          variables('publicIpName')
+        ),
+        '2024-05-01'
+      ).ipAddress, 'N/A - Public IP not enabled')]"
+    },
+
+    "sshCommand": {
+      "type": "string",
+      "condition": "[parameters('enablePublicIp')]",
+      "value": "[if(parameters('enablePublicIp'), concat('ssh -i <your-private-key> ', parameters('adminUsername'), '@', reference(
+        resourceId(
+          'Microsoft.Network/publicIPAddresses',
+          variables('publicIpName')
+        ),
+        '2024-05-01'
+      ).ipAddress), 'N/A - Public IP not enabled')]"
+    },
+
+    "managedIdentityId": {
+      "type": "string",
+      "value": "[resourceId(
+        'Microsoft.ManagedIdentity/userAssignedIdentities',
+        concat(parameters('vmName'), '-identity')
+      )]"
     }
   }
 }
