@@ -1,5 +1,4 @@
 <#
-.synopsis
     Exports all Entra ID users to a TXT file.
 
 .desc
