@@ -1,10 +1,8 @@
 <#
+.SYNOPSIS
     performs a basic health check against one or more Windows servers.
 
-.desc
-    Test-ServerHealth.ps1 checks the availability and health of remote
-    Windows servers.
-
+.DESCRIPTION
     the script performs the following checks:
         - ICMP connectivity (Ping)
         - DNS resolution
@@ -17,6 +15,9 @@
 
     results are displayed in the console and can optionally be exported
     to a CSV file.
+    all remote system data (CIM classes, services, registry) is collected
+    with a single Invoke-Command call per server instead of many separate
+    remote calls, and multiple servers can be checked concurrently.
 
 .PARAMETER ComputerName
     one or more Windows server names or IP addresses to check.
@@ -24,20 +25,31 @@
 .PARAMETER OutputPath
     optional path for exporting the results to CSV.
 
+.PARAMETER Credential
+    optional credential to use for CIM/WinRM connections to the remote servers.
+
+.PARAMETER PortTimeoutMs
+    timeout, in milliseconds, for each TCP port check. Default is 1000.
+
+.PARAMETER ThrottleLimit
+    maximum number of servers to check concurrently. Default is 5.
+    requires PowerShell 7+; on Windows PowerShell 5.1 servers are checked
+    sequentially regardless of this value.
+
 .EXAMPLE
     .\Test-ServerHealth.ps1 -ComputerName SERVER01
     checks the health of SERVER01.
 
 .EXAMPLE
     .\Test-ServerHealth.ps1 -ComputerName SERVER01,SERVER02
-    checks multiple servers.
+    checks multiple servers concurrently.
 
 .EXAMPLE
     .\Test-ServerHealth.ps1 -ComputerName SERVER01 -OutputPath ".\ServerHealth.csv"
     checks SERVER01 and exports the results to a CSV file.
 
-.note
-    this script is intended for Windows environments where PowerShell
+.NOTES
+    This script is intended for Windows environments where PowerShell
     remoting and appropriate administrative permissions are available.
 #>
 
@@ -45,8 +57,18 @@
 param (
     [Parameter(Mandatory = $true)]
     [string[]]$ComputerName,
+
     [Parameter(Mandatory = $false)]
-    [string]$OutputPath
+    [string]$OutputPath,
+
+    [Parameter(Mandatory = $false)]
+    [System.Management.Automation.PSCredential]$Credential,
+
+    [Parameter(Mandatory = $false)]
+    [int]$PortTimeoutMs = 1000,
+
+    [Parameter(Mandatory = $false)]
+    [int]$ThrottleLimit = 5
 )
 
 # basic configuration
@@ -61,86 +83,203 @@ $ServicesToCheck = @(
     "EventLog"
 )
 
-# store all results here so that they can later be exported to CSV.
-$Results = @()
-function Test-ServerHealth {
+# single scriptblock that gathers ALL remote system data in one Invoke-Command call
+# (previously this was ~7+ separate remote calls. fixed it)
+$RemoteInfoScriptBlock = {
+    param ($ServiceNames)
+
+    $Result = [ordered]@{
+        CpuUsage        = $null
+        MemoryPercent   = $null
+        Disks           = @()
+        Services        = @()
+        RebootRequired  = $false
+        Error           = $null
+    }
+
+    try {
+        $Os        = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+        $System    = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+        $Processor = Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop
+        $Disks     = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType = 3" -ErrorAction Stop
+
+        $Result.CpuUsage = [math]::Round(
+            ($Processor | Measure-Object -Property LoadPercentage -Average).Average,
+            2
+        )
+
+        $TotalMemoryGB = [math]::Round($System.TotalPhysicalMemory / 1GB, 2)
+        $FreeMemoryGB  = [math]::Round($Os.FreePhysicalMemory / 1MB, 2)
+        $UsedMemoryGB  = [math]::Round($TotalMemoryGB - $FreeMemoryGB, 2)
+        $Result.MemoryPercent = if ($TotalMemoryGB -gt 0) {
+            [math]::Round(($UsedMemoryGB / $TotalMemoryGB) * 100, 2)
+        } else {
+            0
+        }
+
+        $Result.Disks = foreach ($Disk in $Disks) {
+            $FreePercent = if ($Disk.Size -gt 0) {
+                [math]::Round(($Disk.FreeSpace / $Disk.Size) * 100, 2)
+            } else {
+                0
+            }
+            [PSCustomObject]@{
+                DeviceID    = $Disk.DeviceID
+                FreeGB      = [math]::Round($Disk.FreeSpace / 1GB, 2)
+                FreePercent = $FreePercent
+            }
+        }
+
+        $Result.Services = foreach ($Name in $ServiceNames) {
+            $Svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+            [PSCustomObject]@{
+                Name   = $Name
+                Status = if ($Svc) { $Svc.Status.ToString() } else { "NotInstalled" }
+            }
+        }
+
+        $RebootPaths = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending",
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
+        )
+        foreach ($Path in $RebootPaths) {
+            if (Test-Path $Path -ErrorAction SilentlyContinue) {
+                $Result.RebootRequired = $true
+                break
+            }
+        }
+    }
+    catch {
+        $Result.Error = $_.Exception.Message
+    }
+
+    return [PSCustomObject]$Result
+}
+
+# the whole per-server check is a scriptblock (rather than a function) so it can be
+# handed to remote/parallel runspaces via $using: without relying on cross-runspace
+# function transfer, which is fragile. Test-TcpPort is nested inside it so it's always
+# defined in whatever runspace this scriptblock actually executes in.
+$TestServerHealthScriptBlock = {
     param (
         [Parameter(Mandatory = $true)]
-        [string]$Server
+        [string]$Server,
+        [System.Management.Automation.PSCredential]$Credential,
+        [int]$PortTimeoutMs,
+        [hashtable]$PortsToTest,
+        [string[]]$ServicesToCheck,
+        [scriptblock]$RemoteInfoScriptBlock
     )
+
+# fast TCP port test - avoids the overhead of Test-NetConnection for a simple reachability check
+    function Test-TcpPort {
+        param (
+            [string]$ComputerName,
+            [int]$Port,
+            [int]$TimeoutMs = 1000
+        )
+        $Client = New-Object System.Net.Sockets.TcpClient
+        try {
+            $AsyncResult = $Client.BeginConnect($ComputerName, $Port, $null, $null)
+            $Connected = $AsyncResult.AsyncWaitHandle.WaitOne($TimeoutMs)
+            if ($Connected -and $Client.Connected) {
+                $Client.EndConnect($AsyncResult)
+                return $true
+            }
+            return $false
+        }
+        catch {
+            return $false
+        }
+        finally {
+            $Client.Close()
+        }
+    }
+
     Write-Host ""
     Write-Host "============================================"
     Write-Host " Server Health Check: $Server"
     Write-Host "============================================"
+
+# default shape - every field is always present so CSV/table output stays consistent
+# regardless of how far the checks got before something failed
+    $Output = [ordered]@{
+        ComputerName  = $Server
+        Ping          = "N/A"
+        DNS           = "N/A"
+        RDP           = "N/A"
+        SMB           = "N/A"
+        WinRM         = "N/A"
+        CPUPercent    = "N/A"
+        MemoryPercent = "N/A"
+        DiskStatus    = "N/A"
+        Services      = "N/A"
+        PendingReboot = "N/A"
+        OverallStatus = "N/A"
+        Error         = $null
+        Timestamp     = Get-Date
+    }
 
 # connectivity, ICMP
     Write-Host "`n[Connectivity]"
     $PingResult = Test-Connection -ComputerName $Server -Count 1 -Quiet -ErrorAction SilentlyContinue
     if ($PingResult) {
         Write-Host "[PASS] Ping: Server is reachable"
-        $PingStatus = "PASS"
+        $Output.Ping = "PASS"
     }
     else {
         Write-Host "[FAIL] Ping: Server is unreachable"
-        $PingStatus = "FAIL"
+        $Output.Ping = "FAIL"
     }
 
-# DNS
+# DNS - using .NET resolution directly instead of Resolve-DnsName to avoid the
+# DnsClient module load overhead
     try {
-        $DnsResult = Resolve-DnsName -Name $Server -ErrorAction Stop
+        [void][System.Net.Dns]::GetHostEntry($Server)
         Write-Host "[PASS] DNS: Resolution successful"
-        $DnsStatus = "PASS"
+        $Output.DNS = "PASS"
     }
     catch {
         Write-Host "[FAIL] DNS: Resolution failed"
-        $DnsStatus = "FAIL"
+        $Output.DNS = "FAIL"
     }
 
-# TCP connection
+# TCP ports
     Write-Host "`n[TCP Ports]"
-    $PortResults = @{}
     foreach ($Service in $PortsToTest.Keys) {
         $Port = $PortsToTest[$Service]
-        $TcpResult = Test-NetConnection `
-            -ComputerName $Server `
-            -Port $Port `
-            -InformationLevel Quiet `
-            -WarningAction SilentlyContinue
-        if ($TcpResult) {
+        $Reachable = Test-TcpPort -ComputerName $Server -Port $Port -TimeoutMs $PortTimeoutMs
+        if ($Reachable) {
             Write-Host "[PASS] $Service`: TCP $Port is reachable"
-            $PortResults[$Service] = "PASS"
+            $Output[$Service] = "PASS"
         }
         else {
             Write-Host "[FAIL] $Service`: TCP $Port is unreachable"
-            $PortResults[$Service] = "FAIL"
+            $Output[$Service] = "FAIL"
         }
     }
 
-<# Remote Server Information
-Get-CimInstance uses CIM/WMI to retrieve information from
-the remote Windows server.
-unlike running Get-CimInstance without -ComputerName, this
-queries the target server rather than the local computer. #>   
+# remote system data - gathers CPU, memory, disk,
+# services and reboot status together
     Write-Host "`n[System Resources]"
-    try {
-        $OperatingSystem = Get-CimInstance `
-            -ClassName Win32_OperatingSystem `
-            -ComputerName $Server `
-            -ErrorAction Stop
-        $ComputerSystem = Get-CimInstance `
-            -ClassName Win32_ComputerSystem `
-            -ComputerName $Server `
-            -ErrorAction Stop
-        $Processor = Get-CimInstance `
-            -ClassName Win32_Processor `
-            -ComputerName $Server `
-            -ErrorAction Stop
+    $InvokeParams = @{
+        ComputerName = $Server
+        ScriptBlock  = $RemoteInfoScriptBlock
+        ArgumentList = @(, $ServicesToCheck)
+        ErrorAction  = "Stop"
+    }
+    if ($Credential) { $InvokeParams["Credential"] = $Credential }
 
-# CPU
-        $CpuUsage = [math]::Round(
-            ($Processor | Measure-Object -Property LoadPercentage -Average).Average,
-            2
-        )
+    try {
+        $RemoteData = Invoke-Command @InvokeParams
+
+        if ($RemoteData.Error) {
+            throw $RemoteData.Error
+        }
+
+        # CPU
+        $CpuUsage = $RemoteData.CpuUsage
+        $Output.CPUPercent = $CpuUsage
         if ($CpuUsage -lt 80) {
             Write-Host "[PASS] CPU: $CpuUsage%"
             $CpuStatus = "PASS"
@@ -154,25 +293,9 @@ queries the target server rather than the local computer. #>
             $CpuStatus = "FAIL"
         }
 
-<# Memory
-Win32_OperatingSystem exposes total and free physical memory
-in bytes. gets converted into GB for readability. #>
-        $TotalMemoryGB = [math]::Round(
-            $ComputerSystem.TotalPhysicalMemory / 1GB,
-            2
-        )
-        $FreeMemoryGB = [math]::Round(
-            $OperatingSystem.FreePhysicalMemory / 1MB,
-            2
-        )
-        $UsedMemoryGB = [math]::Round(
-            $TotalMemoryGB - $FreeMemoryGB,
-            2
-        )
-        $MemoryUsagePercent = [math]::Round(
-            ($UsedMemoryGB / $TotalMemoryGB) * 100,
-            2
-        )
+        # memory
+        $MemoryUsagePercent = $RemoteData.MemoryPercent
+        $Output.MemoryPercent = $MemoryUsagePercent
         if ($MemoryUsagePercent -lt 80) {
             Write-Host "[PASS] Memory: $MemoryUsagePercent%"
             $MemoryStatus = "PASS"
@@ -186,87 +309,44 @@ in bytes. gets converted into GB for readability. #>
             $MemoryStatus = "FAIL"
         }
 
-# disk space
+        # disk space
         Write-Host "`n[Disk Space]"
-        $Disks = Get-CimInstance `
-            -ClassName Win32_LogicalDisk `
-            -Filter "DriveType = 3" `
-            -ComputerName $Server `
-            -ErrorAction Stop
         $DiskStatus = "PASS"
-        foreach ($Disk in $Disks) {
-            $FreePercent = [math]::Round(
-                ($Disk.FreeSpace / $Disk.Size) * 100,
-                2
-            )
-            $FreeGB = [math]::Round(
-                $Disk.FreeSpace / 1GB,
-                2
-            )
-            if ($FreePercent -lt 10) {
-                Write-Host "[FAIL] Disk $($Disk.DeviceID): $FreeGB GB free ($FreePercent%)"
+        foreach ($Disk in $RemoteData.Disks) {
+            if ($Disk.FreePercent -lt 10) {
+                Write-Host "[FAIL] Disk $($Disk.DeviceID): $($Disk.FreeGB) GB free ($($Disk.FreePercent)%)"
                 $DiskStatus = "FAIL"
             }
-            elseif ($FreePercent -lt 20) {
-                Write-Host "[WARNING] Disk $($Disk.DeviceID): $FreeGB GB free ($FreePercent%)"
-                if ($DiskStatus -eq "PASS") {
-                    $DiskStatus = "WARNING"
-                }
+            elseif ($Disk.FreePercent -lt 20) {
+                Write-Host "[WARNING] Disk $($Disk.DeviceID): $($Disk.FreeGB) GB free ($($Disk.FreePercent)%)"
+                if ($DiskStatus -eq "PASS") { $DiskStatus = "WARNING" }
             }
             else {
-                Write-Host "[PASS] Disk $($Disk.DeviceID): $FreeGB GB free ($FreePercent%)"
+                Write-Host "[PASS] Disk $($Disk.DeviceID): $($Disk.FreeGB) GB free ($($Disk.FreePercent)%)"
             }
         }
+        $Output.DiskStatus = $DiskStatus
 
-# services
+        # services
         Write-Host "`n[Services]"
         $ServiceStatus = "PASS"
-        foreach ($ServiceName in $ServicesToCheck) {
-            try {
-                $Service = Get-Service `
-                    -Name $ServiceName `
-                    -ComputerName $Server `
-                    -ErrorAction Stop
-                if ($Service.Status -eq "Running") {
-                    Write-Host "[PASS] Service $ServiceName`: Running"
-                }
-                else {
-                    Write-Host "[FAIL] Service $ServiceName`: $($Service.Status)"
-                    $ServiceStatus = "FAIL"
-                }
+        foreach ($Svc in $RemoteData.Services) {
+            if ($Svc.Status -eq "Running") {
+                Write-Host "[PASS] Service $($Svc.Name): Running"
             }
-            catch {
-                Write-Host "[INFO] Service $ServiceName`: Not installed"
+            elseif ($Svc.Status -eq "NotInstalled") {
+                Write-Host "[INFO] Service $($Svc.Name): Not installed"
+            }
+            else {
+                Write-Host "[FAIL] Service $($Svc.Name): $($Svc.Status)"
+                $ServiceStatus = "FAIL"
             }
         }
+        $Output.Services = $ServiceStatus
 
 # pending reboot
-# windows can indicate that a reboot is required through registry keys. useful after patching or software installation.       
         Write-Host "`n[System Status]"
-        $RebootRequired = $false
-        $RebootPaths = @(
-            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending",
-            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
-        )
-        foreach ($Path in $RebootPaths) {
-            try {
-                $RebootCheck = Invoke-Command `
-                    -ComputerName $Server `
-                    -ScriptBlock {
-                        param ($RegistryPath)
-                        Test-Path $RegistryPath
-                    } `
-                    -ArgumentList $Path `
-                    -ErrorAction SilentlyContinue
-                if ($RebootCheck) {
-                    $RebootRequired = $true
-                }
-            }
-            catch {
-# ignore registry paths that cannot be queried
-            }
-        }
-        if ($RebootRequired) {
+        if ($RemoteData.RebootRequired) {
             Write-Host "[WARNING] System requires a reboot"
             $RebootStatus = "WARNING"
         }
@@ -274,17 +354,18 @@ in bytes. gets converted into GB for readability. #>
             Write-Host "[PASS] No pending reboot detected"
             $RebootStatus = "PASS"
         }
+        $Output.PendingReboot = $RebootStatus
 
 # overall status
         if (
-            $PingStatus -eq "FAIL" -or
-            $DnsStatus -eq "FAIL" -or
+            $Output.Ping -eq "FAIL" -or
+            $Output.DNS -eq "FAIL" -or
             $CpuStatus -eq "FAIL" -or
             $MemoryStatus -eq "FAIL" -or
             $DiskStatus -eq "FAIL" -or
             $ServiceStatus -eq "FAIL"
         ) {
-            $OverallStatus = "FAIL"
+            $Output.OverallStatus = "FAIL"
         }
         elseif (
             $CpuStatus -eq "WARNING" -or
@@ -292,52 +373,51 @@ in bytes. gets converted into GB for readability. #>
             $DiskStatus -eq "WARNING" -or
             $RebootStatus -eq "WARNING"
         ) {
-            $OverallStatus = "WARNING"
+            $Output.OverallStatus = "WARNING"
         }
         else {
-            $OverallStatus = "HEALTHY"
+            $Output.OverallStatus = "HEALTHY"
         }
         Write-Host ""
-        Write-Host "Overall Status: $OverallStatus"
-
-# return structured data
-        return [PSCustomObject]@{
-            ComputerName       = $Server
-            Ping               = $PingStatus
-            DNS                = $DnsStatus
-            RDP                = $PortResults["RDP"]
-            SMB                = $PortResults["SMB"]
-            WinRM              = $PortResults["WinRM"]
-            CPUPercent         = $CpuUsage
-            MemoryPercent      = $MemoryUsagePercent
-            DiskStatus         = $DiskStatus
-            Services           = $ServiceStatus
-            PendingReboot      = $RebootStatus
-            OverallStatus      = $OverallStatus
-            Timestamp          = Get-Date
-        }
-
+        Write-Host "Overall Status: $($Output.OverallStatus)"
     }
     catch {
-
-# return a failed result instead of terminating the entire script.
         Write-Host "[FAIL] Unable to retrieve remote server information."
         Write-Host "       $($_.Exception.Message)"
-        return [PSCustomObject]@{
-            ComputerName  = $Server
-            Ping          = $PingStatus
-            DNS           = $DnsStatus
-            OverallStatus = "FAIL"
-            Error         = $_.Exception.Message
-            Timestamp     = Get-Date
-        }
+        $Output.OverallStatus = "FAIL"
+        $Output.Error = $_.Exception.Message
+        Write-Host ""
+        Write-Host "Overall Status: $($Output.OverallStatus)"
     }
+
+    return [PSCustomObject]$Output
 }
 
-# main
-foreach ($Server in $ComputerName) {
-    $Result = Test-ServerHealth -Server $Server
-    $Results += $Result
+# main - check servers concurrently on PowerShell 7+, sequentially on Windows PowerShell 5.1
+# (ForEach-Object -Parallel runs each iteration in its own runspace, so everything the
+# scriptblock needs is passed explicitly via $using: rather than relying on shared state)
+$Results = if ($PSVersionTable.PSVersion.Major -ge 7 -and $ComputerName.Count -gt 1) {
+    $ComputerName | ForEach-Object -Parallel {
+        $Sb = $using:TestServerHealthScriptBlock
+        & $Sb `
+            -Server $_ `
+            -Credential $using:Credential `
+            -PortTimeoutMs $using:PortTimeoutMs `
+            -PortsToTest $using:PortsToTest `
+            -ServicesToCheck $using:ServicesToCheck `
+            -RemoteInfoScriptBlock $using:RemoteInfoScriptBlock
+    } -ThrottleLimit $ThrottleLimit
+}
+else {
+    foreach ($Server in $ComputerName) {
+        & $TestServerHealthScriptBlock `
+            -Server $Server `
+            -Credential $Credential `
+            -PortTimeoutMs $PortTimeoutMs `
+            -PortsToTest $PortsToTest `
+            -ServicesToCheck $ServicesToCheck `
+            -RemoteInfoScriptBlock $RemoteInfoScriptBlock
+    }
 }
 
 # CSV export so it can open in excel or be used by another automation process
