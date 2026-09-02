@@ -1,5 +1,4 @@
 <#
-.synopsis
     This script is similar to Export-EntraUserstxt.ps1, but uses Export-Csv
     instead of Out-File.
     Export-Csv creates structured CSV data.
