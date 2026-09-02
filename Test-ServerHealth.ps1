@@ -228,8 +228,9 @@ $TestServerHealthScriptBlock = {
         $Output.Ping = "PASS"
     }
     else {
-        Write-Host "[FAIL] Ping: Server is unreachable"
-        $Output.Ping = "FAIL"
+# ICMP can be blocked by firewall policy even when the server is healthy so it is only a warning
+        Write-Host "[WARNING] Ping: Server did not respond to ICMP"
+        $Output.Ping = "WARNING"
     }
 
 # DNS - using .NET resolution directly instead of Resolve-DnsName to avoid the
@@ -254,8 +255,9 @@ $TestServerHealthScriptBlock = {
             $Output[$Service] = "PASS"
         }
         else {
-            Write-Host "[FAIL] $Service`: TCP $Port is unreachable"
-            $Output[$Service] = "FAIL"
+# TCP can be disabled on purpose or blocked by firewall policy even when the server is healthy so it is only a warning
+            Write-Host "[WARNING] $Service`: TCP $Port is unreachable"
+            $Output[$Service] = "WARNING"
         }
     }
 
@@ -358,7 +360,6 @@ $TestServerHealthScriptBlock = {
 
 # overall status
         if (
-            $Output.Ping -eq "FAIL" -or
             $Output.DNS -eq "FAIL" -or
             $CpuStatus -eq "FAIL" -or
             $MemoryStatus -eq "FAIL" -or
@@ -368,6 +369,10 @@ $TestServerHealthScriptBlock = {
             $Output.OverallStatus = "FAIL"
         }
         elseif (
+            $Output.Ping -eq "WARNING" -or
+            $Output.RDP -eq "WARNING" -or
+            $Output.SMB -eq "WARNING" -or
+            $Output.WinRM -eq "WARNING" -or
             $CpuStatus -eq "WARNING" -or
             $MemoryStatus -eq "WARNING" -or
             $DiskStatus -eq "WARNING" -or
