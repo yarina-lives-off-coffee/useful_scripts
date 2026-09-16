@@ -104,7 +104,7 @@ the sentinel rule answers:
 smart lockout answers:
 "should this authentication attempt be temporarily blocked?"
 
-# 3. microsoft sentinel
+## 3. microsoft sentinel
 sentinel acts as the siem and security orchestration layer.
 it receives entra authentication telemetry and evaluates it using kql analytics rules.
 primary detections include:
@@ -115,25 +115,25 @@ detects authentication failures affecting multiple users from the same source ip
 ### mfa-related detection
 monitors repeated mfa-related authentication failures and suspicious authentication behavior.
 
-# 4. kql
+## 4. kql
 kusto query language is used for sentinel detection logic.
 the query deliberately returns additional context so that the resulting sentinel incident contains useful information for investigation.
 
-# 5. sentinel analytics rules
+## 5. sentinel analytics rules
 analytics rules convert kql queries into sentinel detections.
 the analytics rule creates a sentinel incident when the detection condition is met.
 
-# 6. sentinel automation rules
+## 6. sentinel automation rules
 automation rules determine what happens after sentinel generates an incident.
 this keeps detection and response logic separate.
 
-# 7. logic app / sentinel playbook
+## 7. logic app / sentinel playbook
 the playbook provides automated incident orchestration.
 the normal three-failure scenario does **not** disable the entra account through the playbook.
 temporary authentication protection is handled by smart lockout.
 graph-based account disabling is reserved for confirmed or high-confidence incidents.
 
-# 8. microsoft graph powershell
+## 8. microsoft graph powershell
 microsoft graph powershell is used for administrative operations that should not be embedded directly into the kql detection.
 for emergency response, a separate script can disable an account
 this operation is intentionally separate from smart lockout.
@@ -179,17 +179,17 @@ an attacker may distribute attempts across multiple accounts instead of repeated
 for this reason, a second detection should analyze failures by ip address:
 this complements the per-user detection.
 
-# mfa considerations
+## mfa considerations
 mfa should be treated separately from password failures.
 mfa-related queries should use the authentication fields and event values available in the organization's actual 
 entra sign-in logs rather than assuming that every tenant exposes identical event descriptions.
 
-# permissions
+## permissions
 the project should follow least-privilege principles.
 production deployments should use managed identities or service principals where appropriate instead of embedding credentials in scripts.
 secrets should never be committed to git.
 
-# testin
+## testin
 testing should be performed in a dedicated test environment where possible.
 test 1:
 one user + repeated failures
