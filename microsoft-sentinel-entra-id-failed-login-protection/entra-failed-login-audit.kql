@@ -1,0 +1,47 @@
+// microsoft sentinel - entra id failed login audit
+//
+// purpose:
+//   detect more than 3 failed entra id sign-in attempts
+//   against the same user within a rolling 15-minute window.
+//
+// data source:
+//   microsoft entra id sign-in logs
+//
+// detection:
+//   > 3 failed sign-in attempts per user / 15 minutes
+//
+// response:
+//   sentinel incident
+//       -> automation rule
+//       -> logic app / playbook
+//
+// authentication enforcement:
+//   entra id smart lockout
+//
+// related security controls:
+//   mfa
+//   conditional access
+
+| where TimeGenerated >= ago(15m)
+
+| where ResultType != 0
+
+| summarize
+    FailedAttempts = count(),
+    FirstFailure = min(TimeGenerated),
+    LastFailure = max(TimeGenerated),
+    IPAddresses = make_set(IPAddress, 20),
+    Applications = make_set(AppDisplayName, 20),
+    FailureReasons = make_set(ResultDescription, 20)
+    by UserPrincipalName
+
+| where FailedAttempts > 3
+
+| project
+    UserPrincipalName,
+    FailedAttempts,
+    FirstFailure,
+    LastFailure,
+    IPAddresses,
+    Applications,
+    FailureReasons
