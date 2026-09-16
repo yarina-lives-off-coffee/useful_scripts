@@ -1,0 +1,40 @@
+Windows Registry Editor Version 5.00
+
+; ================================================================
+; VMware Win7 Printer Fix - Legacy Printers Shell Folder
+; ================================================================
+;
+; ISSUE:
+; Windows 7 VM is running under VMware Workstation Player 16.2.5
+; with VMware Tools 11.3.5.
+; The host has multiple network printers installed.
+; VMware successfully redirects all of them through the TPVM port,
+; but Windows 7 Devices and Printers only displays the host`s
+; default printer as a single printer object.
+;
+; The other redirected printers can be seen through the VMware
+; printer properties, but Windows 7 does not display them as
+; separate printer objects in the normal Devices and Printers
+; interface.
+;
+; IMPORTANT:
+; This has annoyed me and plagued my existence.
+; This is NOT an RDP printer-redirection problem.
+; RDP printer redirection Group Policy settings are not involved.
+; VMware virtual printing is already enabled.
+; The TPVM port is working.
+; Do NOT delete the TPVM port or reinstall VMware Tools just
+; because the printers appear grouped.
+;
+; FIX:
+; This registry key restores the legacy Windows Printers
+; shell folder. It provides an alternative/legacy printer
+; namespace that can expose redirected VMware/ThinPrint printers
+; individually instead of relying on the Windows 7 Devices and
+; Printers view.
+;
+; DATE ADDED:
+; 2026-09-16
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{2227a280-3aea-1069-a2de-08002b30309d}]
+@="Printers"
