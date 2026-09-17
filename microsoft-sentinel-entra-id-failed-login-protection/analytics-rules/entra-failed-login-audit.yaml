@@ -1,0 +1,107 @@
+# microsoft sentinel analytics rule
+# entra id failed login audit
+#
+# purpose:
+#   detect more than 3 failed entra id sign-in attempts
+#   against the same user within a rolling 15-minute window.
+#   uses T1110 bruteforce
+#
+# detection query:
+#   queries/entra-failed-login-audit.kql
+#
+# response:
+#   detection only.
+#   account lockout is handled by entra smart lockout.
+
+id: 7c4e1d92-6f53-4b87-a1c8-93e6d2f04b71
+
+name: Entra ID multiple failed sign-ins
+
+description: |
+  detects users experiencing more than three failed Microsoft Entra ID
+  sign-in attempts within a rolling 15-minute period.
+
+  this rule is intended to identify repeated authentication failures
+  and provide Microsoft Sentinel with an investigation signal.
+
+  the rule does not directly disable or lock the account.
+  entra ID Smart Lockout should be used for authentication lockout,
+  while confirmed compromise can be handled separately through
+  an automated response playbook.
+
+severity: Medium
+
+requiredDataConnectors:
+  - connectorId: AzureActiveDirectory
+    dataTypes:
+      - SigninLogs
+
+queryFrequency: 5m
+
+queryPeriod: 15m
+
+triggerOperator: gt
+
+triggerThreshold: 0
+
+tactics:
+  - CredentialAccess
+
+relevantTechniques:
+  - T1110
+
+status: Available
+
+query: |
+  SigninLogs
+  | where TimeGenerated >= ago(15m)
+  | where ResultType != 0
+  | where isnotempty(UserPrincipalName)
+  | summarize
+      FailedAttempts = count(),
+      FirstFailure = min(TimeGenerated),
+      LastFailure = max(TimeGenerated),
+      IPAddresses = make_set(IPAddress, 20),
+      Applications = make_set(AppDisplayName, 20),
+      FailureReasons = make_set(ResultDescription, 20)
+      by UserPrincipalName
+  | where FailedAttempts > 3
+  | project
+      UserPrincipalName,
+      FailedAttempts,
+      FirstFailure,
+      LastFailure,
+      IPAddresses,
+      Applications,
+      FailureReasons
+
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: UserPrincipalName
+
+customDetails:
+  FailedAttempts: FailedAttempts
+  FirstFailure: FirstFailure
+  LastFailure: LastFailure
+  IPAddresses: IPAddresses
+  Applications: Applications
+  FailureReasons: FailureReasons
+
+eventGroupingSettings:
+  aggregationKind: AlertPerResult
+
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: 1h
+    matchingMethod: Selected
+    groupByEntities:
+      - Account
+
+version: 1.0.0
+
+kind: Scheduled
