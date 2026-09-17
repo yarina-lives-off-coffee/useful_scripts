@@ -46,7 +46,7 @@ actions:
   - order: 1
     actionType: RunPlaybook
     playbookName: Entra-FailedLogin-Response
-    playbookResourceGroup: Sentinel-Security
+    playbookResourceGroup: "<PLAYBOOK-RESOURCE-GROUP>"
     playbookSubscriptionId: "<AZURE-SUBSCRIPTION-ID>"
 
 conditions:
