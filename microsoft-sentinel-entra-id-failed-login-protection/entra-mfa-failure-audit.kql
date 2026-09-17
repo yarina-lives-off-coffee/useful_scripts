@@ -1,0 +1,41 @@
+// microsoft sentinel - entra id mfa failure audit
+//
+// purpose:
+//   detect users experiencing repeated mfa-related failures
+//   within a rolling 15-minute window.
+//
+// detection logic:
+//   - looks at entra id signinlogs
+//   - identifies failed sign-ins associated with mfa
+//   - groups failures by user
+//   - triggers when a user has more than 3 mfa failures
+//
+// important:
+//   this is an audit/detection query.
+//   it does not disable or lock the account.
+
+SigninLogs
+| where TimeGenerated >= ago(15m)
+| where ResultType != 0
+| where AuthenticationRequirement =~ "multiFactorAuthentication"
+| where isnotempty(UserPrincipalName)
+| summarize
+    MFAFailures = count(),
+    FirstFailure = min(TimeGenerated),
+    LastFailure = max(TimeGenerated),
+    IPAddresses = make_set(IPAddress, 20),
+    Applications = make_set(AppDisplayName, 20),
+    FailureReasons = make_set(ResultDescription, 20),
+    AuthenticationMethods = make_set(AuthenticationMethodsUsed, 20)
+    by UserPrincipalName
+| where MFAFailures > 3
+| project
+    UserPrincipalName,
+    MFAFailures,
+    FirstFailure,
+    LastFailure,
+    IPAddresses,
+    Applications,
+    FailureReasons,
+    AuthenticationMethods
+| order by MFAFailures desc
